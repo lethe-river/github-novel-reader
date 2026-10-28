@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>gnr stress</title>
+<style>body { font: 14px/1.6 sans-serif; margin: 30px; } #out { white-space: pre-wrap; background: #f6f6f6; padding: 12px; }</style>
+</head>
+<body>
+<h1>GitHub 阅读器 · 规模与交互测试</h1>
+<pre id="out">running…</pre>
+
+<script src="github-novel-reader.user.js"></script>
+<script>
+(async function () {
+  const out = document.getElementById('out');
+  const results = [];
+  const ok = (name, cond, extra) => results.push((cond ? 'PASS' : 'FAIL') + ' | ' + name + (extra ? ' | ' + extra : ''));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitFor(fn, label, timeout) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (timeout || 8000)) {
+      try { const v = fn(); if (v) return v; } catch (e) {}
+      await sleep(60);
+    }
+    throw new Error('timeout: ' + label);
+  }
+  const press = (key, target) => (target || document).dispatchEvent(
+    new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  );
+  const q = (sel, root) => (root || document).querySelector(sel);
+  const qa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const rootEl = () => document.getElementById('gnr-root');
+  const isOpen = () => { const r = rootEl(); return !!r && !r.hidden; };
+
+  function importFile(name, data) {
+    const input = q('#gnr-file');
+    if (!input) throw new Error('no file input');
+    const dt = new DataTransfer();
+    dt.items.add(new File([data], name, { type: 'text/plain' }));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function readPos(bookId) {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('gnr-db', 1);
+      req.onsuccess = () => {
+        const d = req.result;
+        const r = d.transaction('positions', 'readonly').objectStore('positions').get(bookId);
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function makeNovel(n) {
+    let s = '《规模之书》\n作者：测试\n\n';
+    for (let i = 1; i <= n; i++) {
+      s += '第' + i + '章 标题' + i + '\n';
+      s += '这是第' + i + '章的正文。' + '内容内容内容内容内容内容内容内容内容。'.repeat(12) + '\n\n';
+    }
+    return s;
+  }
+
+  try {
+    await waitFor(() => rootEl(), 'shell');
+    press('r');
+    await waitFor(() => isOpen(), 'open');
+    await waitFor(() => q('#gnr-file'), 'shelf ready');
+
+    // 1. 300 章的大书
+    const big = makeNovel(300);
+    const t0 = performance.now();
+    importFile('规模之书.txt', big);
+    await waitFor(() => q('.gnr-book'), 'big book row', 15000);
+    const importMs = Math.round(performance.now() - t0);
+    ok('300-chapter import', true, importMs + ' ms, ' + big.length + ' chars');
+    ok('300 chapters detected', /300 章/.test(q('.gnr-book-sub').textContent), q('.gnr-book-sub').textContent);
+
+    // 2. 打开 -> 目录 -> 跳到第 250 章
+    q('.gnr-book-acts [data-act="open"]').click();
+    await waitFor(() => q('.gnr-ch-title'), 'reader');
+    ok('open big book', q('.gnr-ch-title').textContent.trim() === '第1章 标题1', q('.gnr-ch-title').textContent.trim());
+
+    q('.gnr-tab[data-view="toc"]').click();
+    await waitFor(() => qa('#gnr-toc-list .gnr-row').length === 300, '300 toc rows', 15000);
+    ok('toc renders 300 rows', qa('#gnr-toc-list .gnr-row').length === 300);
+    qa('#gnr-toc-list .gnr-row')[249].click();
+    await waitFor(() => q('.gnr-ch-title') && /第250章/.test(q('.gnr-ch-title').textContent), 'jump to 250');
+    ok('toc jump to chapter 250', q('.gnr-ch-title').textContent.trim() === '第250章 标题250', q('.gnr-ch-title').textContent.trim());
+
+    // 3. 滚到底部附近，等防抖保存，再读 IndexedDB
+    const bodyEl = q('#gnr-body');
+    bodyEl.scrollTop = Math.max(0, bodyEl.scrollHeight - bodyEl.clientHeight - 80);
+    await sleep(1400);
+    q('.gnr-tab[data-view="shelf"]').click();
+    await waitFor(() => q('.gnr-book'), 'shelf after read');
+    const bigRow = qa('.gnr-book').find((li) => /规模之书/.test(li.textContent));
+    ok('shelf progress after reading', bigRow && parseFloat(q('.gnr-pct', bigRow).textContent) > 70,
+       bigRow ? q('.gnr-pct', bigRow).textContent : 'no row');
+
+    const id = bigRow.dataset.id;
+    const pos = await readPos(id);
+    ok('position persisted to IndexedDB', !!pos && pos.chapter === 249, JSON.stringify(pos && { chapter: pos.chapter, ratio: +pos.ratio.toFixed(3), percent: +pos.percent.toFixed(1) }));
+
+    // 4. 关闭重开：默认直接打开上次在读的书（第 250 章），且推荐栏选中
+    press('r');
+    await sleep(150);
+    press('r');
+    await waitFor(() => isOpen(), 'reopen reader');
+    await waitFor(() => !rootEl().getAttribute('aria-busy'), 'reopen settled');
+    await waitFor(() => q('.gnr-ch-title'), 'reopen reader view');
+    ok('reopen auto-opens last book', /第250章/.test(q('.gnr-ch-title').textContent), q('.gnr-ch-title').textContent.trim());
+    ok('reopen selects 推荐 tab', q('.gnr-tab[data-view="shelf"]').classList.contains('on'));
+
+    // 5. 无章节标记 -> 分块
+    q('.gnr-tab[data-view="shelf"]').click();
+    await waitFor(() => q('#gnr-file'), 'shelf file input');
+    const plain = '一段没有章节标记的小说。' + '继续写着。'.repeat(5000);
+    importFile('无标记.txt', plain);
+    await waitFor(() => qa('.gnr-book').length === 2, 'chunked book', 15000);
+    const chunkRow = qa('.gnr-book').find((li) => /无标记/.test(li.textContent));
+    ok('chunk fallback creates sections', chunkRow && /章/.test(q('.gnr-book-sub', chunkRow).textContent),
+       chunkRow ? q('.gnr-book-sub', chunkRow).textContent : 'no row');
+    chunkRow.querySelector('.gnr-book-acts [data-act="open"]').click();
+    await waitFor(() => /第 1 节|正文/.test((q('.gnr-ch-title') || {}).textContent || ''), 'chunk reader');
+    ok('chunked chapter title', /第 1 节|正文/.test(q('.gnr-ch-title').textContent), q('.gnr-ch-title').textContent.trim());
+
+    // 6. 重命名
+    q('.gnr-tab[data-view="shelf"]').click();
+    await waitFor(() => qa('.gnr-book').length === 2, 'shelf for rename');
+    const renRow = qa('.gnr-book').find((li) => /规模之书/.test(li.textContent));
+    renRow.querySelector('[data-act="rename"]').click();
+    const renInput = await waitFor(() => q('.gnr-rename'), 'rename input');
+    renInput.value = '改名后的书';
+    renInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    await waitFor(() => qa('.gnr-book').some((li) => /改名后的书/.test(li.textContent)), 'renamed');
+    ok('rename book', true);
+
+    // 7. 删除（两次点击确认）
+    const delRow = qa('.gnr-book').find((li) => /无标记/.test(li.textContent));
+    const delBtn = delRow.querySelector('[data-act="del"]');
+    delBtn.click();
+    await sleep(120);
+    ok('delete needs confirmation', delBtn.textContent.indexOf('确认') >= 0, delBtn.textContent);
+    delBtn.click();
+    await waitFor(() => qa('.gnr-book').length === 1, 'deleted', 8000);
+    ok('delete book', qa('.gnr-book').length === 1);
+
+    press('Escape');
+    await sleep(100);
+  } catch (e) {
+    results.push('FAIL | exception | ' + (e && e.stack ? e.stack.split('\n')[0] : e));
+  }
+
+  out.textContent = results.join('\n') + '\n---DONE---';
+  document.title = 'gnr-stress-done';
+  window.__TESTS__ = results;
+})();
+</script>
+</body>
+</html>

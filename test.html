@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gnr test</title>
+<style>
+  body { font: 14px/1.6 sans-serif; margin: 30px; }
+  #out { white-space: pre-wrap; background: #f6f6f6; padding: 12px; }
+</style>
+</head>
+<body>
+<h1>GitHub 阅读器 · 端到端测试</h1>
+<input id="gb-input" placeholder="github 输入框模拟">
+<pre id="out">running…</pre>
+
+<script src="github-novel-reader.user.js"></script>
+<script>
+(async function () {
+  const out = document.getElementById('out');
+  const results = [];
+  const ok = (name, cond, extra) => {
+    results.push((cond ? 'PASS' : 'FAIL') + ' | ' + name + (extra ? ' | ' + extra : ''));
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitFor(fn, label, timeout) {
+    const t0 = Date.now();
+    const limit = timeout || 6000;
+    while (Date.now() - t0 < limit) {
+      try { const v = fn(); if (v) return v; } catch (e) {}
+      await sleep(60);
+    }
+    throw new Error('timeout: ' + label);
+  }
+  const press = (key, target) => (target || document).dispatchEvent(
+    new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  );
+  const q = (sel, root) => (root || document).querySelector(sel);
+  const qa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const rootEl = () => document.getElementById('gnr-root');
+  const isOpen = () => { const r = rootEl(); return !!r && !r.hidden; };
+
+  const novel = [
+    '《测试之书》',
+    '作者：测试',
+    '',
+    '第一章 开始',
+    '这是第一章的正文内容，用于测试章节识别与阅读。',
+    '',
+    '第二章 继续',
+    '这是第二章的正文内容，继续测试翻章与进度保存。',
+    '',
+    '第三章 结束',
+    '这是第三章的正文内容，故事到这里结束。',
+  ].join('\n');
+
+  function importFile(name, data, type) {
+    const input = q('#gnr-file');
+    if (!input) throw new Error('no file input');
+    const dt = new DataTransfer();
+    dt.items.add(new File([data], name, { type: type || 'text/plain' }));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  try {
+    await waitFor(() => rootEl(), 'shell built');
+
+    // 0. GitHub 输入框里打字不应该触发
+    const gb = q('#gb-input');
+    gb.focus();
+    press('r', gb);
+    await sleep(150);
+    ok('typing guard: R in input does not open', !isOpen());
+
+    // 1. R 打开
+    press('r');
+    await waitFor(() => isOpen(), 'overlay open');
+    await waitFor(() => !rootEl().getAttribute('aria-busy'), 'overlay ready');
+    await waitFor(() => q('.gnr-view-head .gnr-h2'), 'shelf rendered');
+    ok('R opens overlay', isOpen());
+    ok('empty shelf state', !!q('.gnr-empty .gnr-eh'));
+
+    // 1b. 阅读窗口：拖动 / 八向缩放
+    const win = q('#gnr-win');
+    ok('reading window visible', !!win && !win.hidden);
+    const g0 = {
+      left: parseFloat(win.style.left), top: parseFloat(win.style.top),
+      w: parseFloat(win.style.width), h: parseFloat(win.style.height),
+    };
+    ok('window laid out', g0.w >= 360 && g0.h >= 280, JSON.stringify(g0));
+    ok('window borderless', getComputedStyle(win).borderTopWidth === '0px', getComputedStyle(win).borderTopWidth);
+    ok('scrollbar hidden', getComputedStyle(q('#gnr-body')).scrollbarWidth === 'none',
+       getComputedStyle(q('#gnr-body')).scrollbarWidth);
+
+    const pe = (type, target, x, y, id) => target.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y, pointerId: id || 1,
+    }));
+    const bar = q('#gnr-win-bar');
+    pe('pointerdown', bar, 500, 300, 1);
+    pe('pointermove', bar, 560, 340, 1);
+    pe('pointerup', bar, 560, 340, 1);
+    const g1 = { left: parseFloat(win.style.left), top: parseFloat(win.style.top) };
+    ok('window draggable', g1.left - g0.left >= 50 && g1.top - g0.top >= 30, JSON.stringify(g1));
+
+    const se = q('.gnr-rz[data-dir="se"]');
+    pe('pointerdown', se, 800, 600, 2);
+    pe('pointermove', se, 720, 520, 2);
+    pe('pointerup', se, 720, 520, 2);
+    const g2 = { w: parseFloat(win.style.width), h: parseFloat(win.style.height) };
+    ok('window resizable', g2.w < g0.w - 40 && g2.h < g0.h - 40, JSON.stringify(g2));
+
+    // 拖回 / 缩回默认几何，后面的截图和测试都用默认位置
+    pe('pointerdown', bar, 560, 340, 3);
+    pe('pointermove', bar, 500, 300, 3);
+    pe('pointerup', bar, 500, 300, 3);
+    pe('pointerdown', se, 720, 520, 4);
+    pe('pointermove', se, 800, 600, 4);
+    pe('pointerup', se, 800, 600, 4);
+    const g3 = {
+      left: parseFloat(win.style.left), top: parseFloat(win.style.top),
+      w: parseFloat(win.style.width), h: parseFloat(win.style.height),
+    };
+    ok('geometry restored', Math.abs(g3.left - g0.left) < 2 && Math.abs(g3.w - g0.w) < 2, JSON.stringify(g3));
+
+    const saved = JSON.parse(localStorage.getItem('gnr.window.v1') || 'null');
+    ok('window geometry persisted',
+       !!saved && saved.left === parseFloat(win.style.left) && saved.width === parseFloat(win.style.width),
+       JSON.stringify(saved));
+
+    // 空格显示 / 隐藏窗口
+    press(' ');
+    await sleep(120);
+    ok('Space hides window', q('#gnr-win').hidden === true);
+    press(' ');
+    await sleep(120);
+    ok('Space shows window', q('#gnr-win').hidden === false);
+
+    // 输入框里按空格不切换窗口
+    gb.focus();
+    press(' ', gb);
+    await sleep(120);
+    ok('Space in input does not toggle window', q('#gnr-win').hidden === false);
+    gb.blur();
+
+    // 2. 导入 UTF-8 txt
+    importFile('测试之书.txt', novel);
+    await waitFor(() => q('.gnr-book'), 'book row');
+    const bookTitle = q('.gnr-book-title').textContent.trim();
+    ok('import txt + title guess', bookTitle === '测试之书', bookTitle);
+    ok('chapter count in sub', /3 章/.test(q('.gnr-book-sub').textContent));
+
+    // 3. 打开这本书
+    q('.gnr-book-acts [data-act="open"]').click();
+    await waitFor(() => q('.gnr-ch-title'), 'chapter title');
+    ok('open book -> first chapter', q('.gnr-ch-title').textContent.trim() === '第一章 开始',
+       q('.gnr-ch-title').textContent.trim());
+    ok('body text rendered', /第一章的正文/.test(q('#gnr-text').textContent));
+    ok('chapter title not duplicated in body',
+       qa('#gnr-text p').every((p) => p.textContent.trim() !== '第一章 开始'));
+
+    // 窗口隐藏时方向键不翻章
+    press(' ');
+    await sleep(100);
+    const hiddenTitle = q('.gnr-ch-title').textContent;
+    press('ArrowRight');
+    await sleep(180);
+    ok('arrows ignored while window hidden', q('.gnr-ch-title').textContent === hiddenTitle,
+       q('.gnr-ch-title').textContent.trim());
+    press(' ');
+    await sleep(100);
+    ok('Space restores reader view',
+       q('#gnr-win').hidden === false && q('.gnr-ch-title').textContent === hiddenTitle);
+
+    // 4. 右方向键翻章
+    press('ArrowRight');
+    await waitFor(() => q('.gnr-ch-title') && q('.gnr-ch-title').textContent.indexOf('第二章') >= 0, 'chapter 2');
+    ok('ArrowRight -> next chapter', q('.gnr-ch-title').textContent.trim() === '第二章 继续');
+
+    // 5. 目录
+    q('.gnr-tab[data-view="toc"]').click();
+    await waitFor(() => q('#gnr-toc-list .gnr-row'), 'toc list');
+    const rows = qa('#gnr-toc-list .gnr-row');
+    ok('toc has 3 chapters', rows.length === 3, String(rows.length));
+    ok('toc marks current chapter', !!q('#gnr-toc-list .gnr-row.on'));
+
+    // 目录筛选
+    const filter = q('#gnr-filter');
+    filter.value = '第三章';
+    filter.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(120);
+    ok('toc filter works', qa('#gnr-toc-list .gnr-row').length === 1);
+
+    // 6. 回书架看进度
+    q('.gnr-tab[data-view="shelf"]').click();
+    await waitFor(() => q('.gnr-book'), 'shelf again');
+    const pct = parseFloat(q('.gnr-pct').textContent);
+    ok('shelf shows progress', pct > 20 && pct < 60, q('.gnr-pct').textContent);
+
+    // 7. 继续阅读 -> 关闭 -> 重开，位置应恢复
+    q('.gnr-book-acts [data-act="open"]').click();
+    await waitFor(() => q('.gnr-ch-title'), 'reader again');
+    ok('resume at chapter 2', q('.gnr-ch-title').textContent.indexOf('第二章') >= 0,
+       q('.gnr-ch-title').textContent.trim());
+
+    press('r');
+    await sleep(150);
+    ok('R closes overlay', !isOpen());
+    const pageOverflow = document.documentElement.style.overflow;
+    ok('page scroll unlocked', document.body.inert !== true, 'overflow=' + JSON.stringify(pageOverflow));
+
+    press('r');
+    await waitFor(() => isOpen(), 'reopen reader');
+    await waitFor(() => !rootEl().getAttribute('aria-busy'), 'reopen settled');
+    await waitFor(() => q('.gnr-ch-title'), 'reopen reader view');
+    ok('reopen restores reader view', q('.gnr-ch-title').textContent.indexOf('第二章') >= 0,
+       q('.gnr-ch-title').textContent.trim());
+
+    // 8. 目录筛选框里按 R 不应该关闭
+    q('.gnr-tab[data-view="toc"]').click();
+    await waitFor(() => q('#gnr-filter'), 'toc filter');
+    q('#gnr-filter').focus();
+    press('r', q('#gnr-filter'));
+    await sleep(150);
+    ok('typing guard: R in toc filter keeps overlay', isOpen());
+    q('#gnr-filter').blur();
+
+    // 9. Escape 关闭
+    press('Escape');
+    await sleep(150);
+    ok('Escape closes overlay', !isOpen());
+
+    // 10. 重开：默认进入推荐栏 + 上次在读的书；再导入 GBK
+    press('r');
+    await waitFor(() => isOpen(), 'reopen auto open');
+    await waitFor(() => !rootEl().getAttribute('aria-busy'), 'auto open settled');
+    await waitFor(() => q('.gnr-ch-title'), 'auto open rendered');
+    ok('reopen opens last book', q('.gnr-ch-title').textContent.indexOf('第二章') >= 0,
+       q('.gnr-ch-title').textContent.trim());
+    ok('reopen selects 推荐 tab',
+       q('.gnr-tab[data-view="shelf"]').classList.contains('on') &&
+       !q('.gnr-tab[data-view="toc"]').classList.contains('on'));
+    q('.gnr-tab[data-view="shelf"]').click();
+    await waitFor(() => q('#gnr-file'), 'shelf file input');
+    const gbk = new Uint8Array([
+      0xB5,0xDA,0xD2,0xBB,0xD5,0xC2,0x20,0xB2,0xE2,0xCA,0xD4,0x0A,
+      0xD5,0xFD,0xCE,0xC4,0xC4,0xDA,0xC8,0xDD,0x0A,
+      0xB5,0xDA,0xB6,0xFE,0xD5,0xC2,0x20,0xBC,0xCC,0xD0,0xF8,0x0A,
+      0xB8,0xFC,0xB6,0xE0,0xC4,0xDA,0xC8,0xDD,0x0A,
+    ]);
+    importFile('gbk-book.txt', gbk);
+    await waitFor(() => qa('.gnr-book').length === 2, 'second book');
+    const gbkRow = qa('.gnr-book').find((li) => /gbk-book/.test(li.textContent));
+    ok('gbk book imported', !!gbkRow);
+    gbkRow.querySelector('.gnr-book-acts [data-act="open"]').click();
+    await waitFor(() => q('.gnr-ch-title'), 'gbk reader');
+    ok('gb18030 decode', q('.gnr-ch-title').textContent.trim() === '第一章 测试',
+       q('.gnr-ch-title').textContent.trim());
+
+    // 11. 内容溢出时滚动条不占宽度（隐藏滚动条）
+    const bodyEl = q('#gnr-body');
+    const textEl = q('#gnr-text');
+    for (let i = 0; i < 160; i++) {
+      const p = document.createElement('p');
+      p.textContent = '滚动测试段落 ' + i + '，用于检查竖向滚动条是否占位。';
+      textEl.appendChild(p);
+    }
+    await sleep(100);
+    ok('vertical scrollbar takes no width',
+       bodyEl.scrollHeight > bodyEl.clientHeight && bodyEl.offsetWidth === bodyEl.clientWidth,
+       bodyEl.scrollHeight + '/' + bodyEl.clientHeight + ' w=' + bodyEl.offsetWidth + '/' + bodyEl.clientWidth);
+
+    // 12. 关掉，把状态留在页面上供人工检查
+    press('Escape');
+    await sleep(120);
+  } catch (e) {
+    results.push('FAIL | exception | ' + (e && e.stack ? e.stack.split('\n')[0] : e));
+  }
+
+  out.textContent = results.join('\n') + '\n---DONE---';
+  document.title = 'gnr-test-done';
+  window.__TESTS__ = results;
+})();
+</script>
+</body>
+</html>
